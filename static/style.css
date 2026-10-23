@@ -401,3 +401,4 @@ svg.flow .packet { fill: var(--accent); }
 /* Wizard owns the screen: hide navigation and live controls */
 body.wizard-mode .tabs, body.wizard-mode .status, body.wizard-mode #appName { display: none; }
 body.wizard-mode .brand a { pointer-events: none; }
+.wiz-foot a { white-space: nowrap; } /* one solid click target, never split across lines */
