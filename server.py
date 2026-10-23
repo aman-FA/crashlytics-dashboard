@@ -88,6 +88,10 @@ class Mcp:
     def _ensure(self):
         if self.proc and self.proc.poll() is None and self.gen == MCP_GEN:
             return
+        with _spawn_lock:  # one at a time: parallel first-run npx installs corrupt the cache
+            self._start()
+
+    def _start(self):
         if self.proc and self.proc.poll() is None:
             self.proc.kill()  # stale project/credentials from before a config change
         self.gen = MCP_GEN
@@ -98,7 +102,10 @@ class Mcp:
         self._rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                  "clientInfo": {"name": "crash-dash", "version": "1"}})
         self._rpc("notifications/initialized", notify=True)
-        self._call("firebase_update_environment", active_project=args.project)
+        try:
+            self._call("firebase_update_environment", active_project=args.project)
+        except RuntimeError:
+            pass  # signed out or no access yet; sign-in restarts the pool, which retries this
 
     def _call(self, tool, **a):
         res = self._rpc("tools/call", {"name": tool, "arguments": a})
@@ -118,6 +125,7 @@ class Mcp:
 
 
 pool = queue.Queue()
+_spawn_lock = threading.Lock()
 MCP_GEN = 0  # bumped on project/app/sign-in change; pooled processes restart lazily
 
 
