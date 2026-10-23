@@ -398,3 +398,6 @@ svg.flow .packet { fill: var(--accent); }
   background: hsl(var(--h) 75% 58%); animation: confetti 1.8s cubic-bezier(.2, .6, .4, 1) var(--d) both; }
 @keyframes confetti { from { transform: translateY(-30px) rotate(0); opacity: 1; } to { transform: translateY(320px) rotate(var(--r)); opacity: 0; } }
 .wiz-card .wiz-h { font-size: 19px; font-weight: 700; color: var(--ink); justify-content: flex-start; margin: 0 0 6px; }
+/* Wizard owns the screen: hide navigation and live controls */
+body.wizard-mode .tabs, body.wizard-mode .status, body.wizard-mode #appName { display: none; }
+body.wizard-mode .brand a { pointer-events: none; }

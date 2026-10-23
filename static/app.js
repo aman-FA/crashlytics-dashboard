@@ -1268,6 +1268,9 @@ async function route(silent = false) {
   const usersPage = /^#\/users/.test(location.hash);
   const setupPage = /^#\/setup/.test(location.hash);
   const welcomePage = /^#\/welcome/.test(location.hash);
+  // Until setup is finished, the wizard is the only page: no tabs, no back door.
+  if (!welcomePage && !store.get("setupDone", false)) return location.replace("#/welcome");
+  document.body.classList.toggle("wizard-mode", welcomePage);
   document.querySelectorAll(".tabs a").forEach((a) => a.classList.toggle("on",
     a.dataset.tab === (setupPage ? "setup" : usersPage ? "users" : m || welcomePage ? "" : "overview")));
   view.classList.toggle("anim", !silent);
