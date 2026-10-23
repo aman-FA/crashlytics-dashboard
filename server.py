@@ -1015,7 +1015,8 @@ def firebase_login(body):
                 _cache.clear()
         return r
     url = re.search(r"https://\S+", text)
-    sid = re.search(r"session\s*id\W+([\w-]{4,})", text, re.I)
+    # e.g. "Your session ID is: 020DD" (short; must not match later prose like "displayed")
+    sid = re.search(r"session\s*id(?:\s+is)?\s*:\s*([A-Za-z0-9_-]{3,})", text, re.I)
     if url:
         return {"status": "pending", "uri": url.group(0).rstrip(").,`'\""), "sessionId": sid.group(1) if sid else None}
     raise RuntimeError(text.strip()[:400] or "unexpected sign-in response")
