@@ -1,0 +1,5 @@
+# Per-developer settings written by the setup wizard (project, app, repo path)
+config.local.json
+__pycache__/
+*.pyc
+.DS_Store

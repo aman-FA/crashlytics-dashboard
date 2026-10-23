@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Crashlytics Live</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><a href="#/">Crashlytics Live</a><span id="appName" class="muted"></span>
+    <nav class="tabs"><a href="#/" data-tab="overview">Overview</a><a href="#/users" data-tab="users">Users</a><a href="#/setup" data-tab="setup">Setup</a></nav></div>
+  <div class="status"><span id="liveDot" class="dot"></span><span id="status" class="muted">Loading…</span>
+    <button id="refresh" class="btn ghost" title="Refresh now">↻</button>
+    <label class="toggle"><input type="checkbox" id="live" checked> Live</label>
+    <span class="alert-wrap"><button id="notify" class="btn ghost" title="Alert settings">🔕 Alerts off</button>
+      <div id="alertPanel" class="card alert-panel" hidden></div></span>
+  </div>
+</header>
+
+<nav class="filters">
+  <label>App<select id="f-app"></select></label>
+  <label>Version<select id="f-version"><option value="">All versions</option></select></label>
+  <label>Type<select id="f-type">
+    <option value="FATAL">Crashes</option><option value="NON_FATAL">Non-fatals</option>
+    <option value="ANR">ANRs</option><option value="ALL">All events</option></select></label>
+  <label>Range<select id="f-days">
+    <option value="1">Last 24h</option><option value="7" selected>Last 7 days</option>
+    <option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label>
+  <label>Signal<select id="f-signal">
+    <option value="">Any</option><option value="SIGNAL_FRESH">Fresh</option>
+    <option value="SIGNAL_REGRESSED">Regressed</option><option value="SIGNAL_EARLY">Early</option>
+    <option value="SIGNAL_REPETITIVE">Repetitive</option></select></label>
+  <div id="chips" class="chips"></div>
+</nav>
+
+<main id="view"></main>
+<div id="tip" class="tip" hidden></div>
+<script src="wizard.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
