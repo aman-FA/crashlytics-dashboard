@@ -26,7 +26,12 @@
     <option value="ANR">ANRs</option><option value="ALL">All events</option></select></label>
   <label>Range<select id="f-days">
     <option value="1">Last 24h</option><option value="7" selected>Last 7 days</option>
-    <option value="30">Last 30 days</option><option value="90">Last 90 days</option></select></label>
+    <option value="30">Last 30 days</option><option value="90">Last 90 days</option>
+    <option value="custom">Custom range…</option></select></label>
+  <span id="customRange" class="custom-range" title="Pick any date-time window (last 90 days)">
+    <label>From<input type="datetime-local" id="f-from" step="60"></label>
+    <label>To<input type="datetime-local" id="f-to" step="60"></label>
+    <button class="btn" id="f-apply" disabled>Apply</button></span>
   <label>Signal<select id="f-signal">
     <option value="">Any</option><option value="SIGNAL_FRESH">Fresh</option>
     <option value="SIGNAL_REGRESSED">Regressed</option><option value="SIGNAL_EARLY">Early</option>

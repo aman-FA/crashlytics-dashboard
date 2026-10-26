@@ -51,7 +51,9 @@ REDACT_KEYS = re.compile(r"bearer|token|auth|password|secret", re.I)
 TEXT_FIELDS = {"exceptions", "threads", "breadcrumbs", "logs", "title",
                "subtitle", "description", "body"}
 POOL_SIZE = 6
-INDEX_WORKERS = 3  # user-index share of the pool, so pages stay responsive
+INDEX_WORKERS = 4  # user-index share of the pool; 2 stay free so pages stay responsive
+USER_INDEX_TTL = 600  # s before a finished index is refreshed (in the background)
+INDEX_DIR = ROOT / ".cache"  # gitignored; finished user indexes survive restarts
 OVERVIEW_TTL = 120  # s; client polls every 60s, Crashlytics lags ~minutes anyway
 
 args = None
@@ -199,11 +201,40 @@ def metrics(g):
     return out
 
 
-def window(days):
-    now = datetime.now(timezone.utc)
-    start = (now - timedelta(days=days - 1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    return {"intervalStartTime": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "intervalEndTime": now.strftime("%Y-%m-%dT%H:%M:%SZ")}
+def _iso(dt):
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_time(s):
+    dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def time_range(q):
+    """(start, end) in UTC: a custom from/to range, or a rolling window of `days`.
+    Rounded to the minute so repeated requests hit the cache."""
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    oldest = now - timedelta(days=90) + timedelta(hours=1)  # Crashlytics keeps < 90 days
+    if q.get("from") and q.get("to"):
+        try:
+            start, end = _parse_time(q["from"]), min(_parse_time(q["to"]), now)
+        except ValueError:
+            raise NeedsUserAction("That date-time range isn't valid.", None)
+        if start >= end:
+            raise NeedsUserAction("The range must start before it ends (and not in the future).", None)
+        if end <= oldest:
+            raise NeedsUserAction("Crashlytics only keeps the last 90 days; pick a later range.", None)
+        return max(start, oldest), end
+    return max(now - timedelta(days=int(q.get("days", 7))), oldest), now
+
+
+def range_key(q):
+    return [q.get("days"), q.get("from"), q.get("to")]
+
+
+def window(q):
+    start, end = time_range(q)
+    return {"intervalStartTime": _iso(start), "intervalEndTime": _iso(end)}
 
 
 def build_filter(q, with_window=True):
@@ -217,7 +248,7 @@ def build_filter(q, with_window=True):
     if q.get("signal"):
         f["issueSignals"] = [q["signal"]]
     if with_window:
-        f.update(window(int(q.get("days", 7))))
+        f.update(window(q))
     return f
 
 
@@ -260,7 +291,7 @@ _seen, _seen_lock = {}, threading.Lock()
 def overview(q):
     app, flt = q["app"], build_filter(q)
     key = json.dumps([app, flt.get("issueErrorTypes"), q.get("version"), q.get("device"),
-                      q.get("os"), q.get("signal"), q.get("days")])
+                      q.get("os"), q.get("signal"), range_key(q)])
 
     def fetch():
         # Each breakdown drops its own dimension's filter (the API rejects
@@ -301,30 +332,28 @@ def overview(q):
     return cached(("overview", key), OVERVIEW_TTL, fetch)
 
 
-def daily(app, base_flt, days, name="topVersions", pick=None):
-    """One report call per UTC day. Past days never change, so cache them forever."""
+def daily(app, base_flt, start, end, name="topVersions", pick=None):
+    """One report call per UTC day of [start, end], clipped to the range; the last
+    31 days at most. Finished past days never change, so they're cached forever."""
     today = datetime.now(timezone.utc).date()
-    out = {}
+    first = max(start.date(), end.date() - timedelta(days=30))
+    dates = [first + timedelta(days=i) for i in range((end.date() - first).days + 1)]
 
     def one(d):
-        s = f"{d}T00:00:00Z"
-        e = f"{d}T23:59:59Z" if d < today else datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        flt = {**base_flt, "intervalStartTime": s, "intervalEndTime": e}
+        day0 = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
+        s, e = max(day0, start), min(day0 + timedelta(days=1, seconds=-1), end)
+        flt = {**base_flt, "intervalStartTime": _iso(s), "intervalEndTime": _iso(e)}
         ttl = None if d < today else OVERVIEW_TTL
-        groups = cached(("day", app, name, json.dumps(flt if d < today else base_flt, sort_keys=True), str(d)),
-                        ttl, lambda: report(app, name, flt, 50))
+        groups = cached(("day", app, name, json.dumps(flt, sort_keys=True)), ttl, lambda: report(app, name, flt, 50))
         return pick(groups) if pick else groups
 
-    dates = [today - timedelta(days=i) for i in range(days - 1, -1, -1)]
     with ThreadPoolExecutor(POOL_SIZE) as ex:
-        for d, v in zip(dates, ex.map(one, dates)):
-            out[str(d)] = v
-    return [{"date": d, **v} for d, v in out.items()]
+        return [{"date": str(d), **v} for d, v in zip(dates, ex.map(one, dates))]
 
 
 def trend(q, extra=None):
     app, flt = q["app"], {**build_filter(q, with_window=False), **(extra or {})}
-    days = min(int(q.get("days", 7)), 30)
+    start, end = time_range(q)
     version = q.get("version")
 
     def pick(groups):
@@ -337,7 +366,7 @@ def trend(q, extra=None):
                 "impactedUsers": sum(r["impactedUsers"] for r in rows)}
 
     vflt = {k: v for k, v in flt.items() if k != "versionDisplayNames"}
-    return daily(app, vflt, days, "topVersions", pick)
+    return daily(app, vflt, start, end, "topVersions", pick)
 
 
 # --------------------------------------------------------------------- git
@@ -419,7 +448,7 @@ def new_in_release(q):
                 "issues": new, "regressed": regressed, "versionIssues": len(rows),
                 "versionEvents": total, "fetchedAt": time.time()}
 
-    return cached(("newrel", json.dumps([app, flt.get("issueErrorTypes"), q.get("version"), q.get("days")])),
+    return cached(("newrel", json.dumps([app, flt.get("issueErrorTypes"), q.get("version"), range_key(q)])),
                   OVERVIEW_TTL, fetch)
 
 
@@ -499,19 +528,33 @@ def release_diff(q):
             "releaseCommits": others[:40], "releaseCommitCount": len(others)}
 
 
+def _as_dict(v):
+    """Nested event fields arrive as dicts, but one-key blocks (e.g. `free: '123'`)
+    stay a single-line string after parse(); coerce, or fall back to {}."""
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str) and ":" in v:
+        try:
+            d = yload(v)
+            return d if isinstance(d, dict) else {}
+        except yaml.YAMLError:
+            pass
+    return {}
+
+
 def clean_event(e):
-    keys = e.get("customKeys") or {}
+    keys = _as_dict(e.get("customKeys"))
     if isinstance(keys, dict):
         keys = {k: ("•••redacted•••" if REDACT_KEYS.search(k) else v) for k, v in keys.items()}
-    blame = e.get("blameFrame") or {}
+    blame = _as_dict(e.get("blameFrame"))
     return {
         "name": e.get("name"), "time": e.get("eventTime"), "received": e.get("receivedTime"),
-        "device": e.get("device") or {}, "os": e.get("operatingSystem") or {},
-        "version": (e.get("version") or {}).get("displayName"),
-        "user": (e.get("user") or {}).get("id"), "customKeys": keys,
-        "memory": e.get("memory") or {}, "storage": e.get("storage") or {},
+        "device": _as_dict(e.get("device")), "os": _as_dict(e.get("operatingSystem")),
+        "version": _as_dict(e.get("version")).get("displayName"),
+        "user": _as_dict(e.get("user")).get("id"), "customKeys": keys,
+        "memory": _as_dict(e.get("memory")), "storage": _as_dict(e.get("storage")),
         "processState": e.get("processState"), "orientation": e.get("deviceOrientation"),
-        "variant": (e.get("issueVariant") or {}).get("id"),
+        "variant": _as_dict(e.get("issueVariant")).get("id"),
         "blame": blame, "exceptions": e.get("exceptions") or "",
         "threads": e.get("threads") or "", "breadcrumbs": e.get("breadcrumbs") or "",
         "logs": e.get("logs") or "",
@@ -520,8 +563,9 @@ def clean_event(e):
 
 def issue_detail(q):
     app, iid = q["app"], q["id"]
-    flt = {**build_filter(q), "issueId": iid}
-    flt.pop("issueSignals", None)
+    # One issue has one error type: the global Type/Signal filters must not apply,
+    # or a NON_FATAL issue viewed under "Crashes" comes back empty.
+    flt = {**build_filter({**q, "type": "ALL", "signal": ""}), "issueId": iid}
 
     def fetch():
         warnings = []
@@ -589,8 +633,9 @@ def issue_detail(q):
 
 
 def issue_trend(q):
-    # topIssues rejects an issue filter; topVersions accepts it.
-    return trend({k: v for k, v in q.items() if k != "signal"}, {"issueId": q["id"]})
+    # topIssues rejects an issue filter; topVersions accepts it. Type/signal don't
+    # apply to a single issue (see issue_detail).
+    return trend({**q, "type": "ALL", "signal": ""}, {"issueId": q["id"]})
 
 
 # ---------------------------------------------------------------- AI draft
@@ -767,77 +812,126 @@ def analyze_status(q):
 
 # -------------------------------------------------------------- user index
 
-_building, _building_lock, _build_errors, _progress = {}, threading.Lock(), {}, {}
+# Per filter key: {"users": {id: user}, "events", "done", "total", "builtAt", "error", "thread"}.
+# A finished index keeps being served while a refresh builds a new one.
+_indexes, _index_lock = {}, threading.Lock()
+
+
+def _index_file(key):
+    import hashlib
+    return INDEX_DIR / f"users-{hashlib.sha1(json.dumps(key).encode()).hexdigest()[:16]}.json"
+
+
+def _load_index(key):
+    try:
+        d = json.loads(_index_file(key).read_text())
+        return {"users": d["users"], "events": d["events"], "done": d["total"], "total": d["total"],
+                "builtAt": d["builtAt"], "error": None, "thread": None, "truncated": d.get("truncated", {})}
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _save_index(key, st):
+    INDEX_DIR.mkdir(exist_ok=True)
+    tmp = _index_file(key).with_suffix(".tmp")
+    tmp.write_text(json.dumps({"users": st["users"], "events": st["events"], "total": st["total"],
+                               "builtAt": st["builtAt"], "truncated": st["truncated"]}, default=list))
+    tmp.replace(_index_file(key))
+
+
+def _merge_events(users, evs, iid, title, detail=""):
+    """Adds one issue's events into the users map; returns the event count."""
+    n = 0
+    for raw in evs if isinstance(evs, list) else []:
+        e, n = clean_event(raw), n + 1
+        k = e["customKeys"] if isinstance(e["customKeys"], dict) else {}
+        uid = e["user"] or k.get("user_id")
+        if not uid:
+            continue
+        u = users.setdefault(uid, {"id": uid, "name": k.get("user_Name") or k.get("user_name"),
+                                   "company": k.get("company_id"), "events": 0, "issues": {},
+                                   "devices": [], "versions": [], "recent": []})
+        u["events"] += 1
+        for f, v in (("devices", e["device"].get("displayName")), ("versions", e["version"])):
+            if v and v not in u[f]:
+                u[f].append(v)
+        it = u["issues"].setdefault(iid, {"id": iid, "title": title, "detail": detail, "events": 0, "last": ""})
+        it["events"] += 1
+        it["last"] = max(it["last"], e["time"] or "")
+        u["recent"].append({"time": e["time"], "issueId": iid, "title": title, "version": e["version"],
+                            "device": e["device"].get("displayName"), "os": e["os"].get("displayVersion"),
+                            "memFree": e["memory"].get("free")})
+        u["recent"] = sorted(u["recent"], key=lambda x: x["time"] or "", reverse=True)[:30]
+    return n
+
+
+def _build_index(key, q, base, st):
+    try:
+        issues = [i for i in overview(q)["issues"] if i["state"] == "OPEN"][:USER_INDEX_ISSUES]
+        st["total"] = len(issues)
+
+        def fetch(i):
+            evs = parse(mcp("crashlytics_list_events", appId=q["app"],
+                            filter={**base, "issueId": i["id"]}, pageSize=100))
+            with _index_lock:  # merge as each issue lands, so the UI fills in progressively
+                # Same title can mean different errors (e.g. two DioMixin.fetch issues); keep the message.
+                detail = re.sub(r"^[\w.$]+?(Error|Exception)\s*-\s*|\.?\s*Error thrown .*$", "", i.get("subtitle") or "")[:120]
+                n = _merge_events(st["users"], evs, i["id"], i["title"], detail)
+                st["events"] += n
+                st["done"] += 1
+                if n >= 100:  # page full: older events of this busy issue weren't read
+                    times = [e.get("eventTime") for e in evs if isinstance(e, dict) and e.get("eventTime")]
+                    st["truncated"][i["id"]] = {"title": i["title"], "since": min(times) if times else None}
+        with ThreadPoolExecutor(INDEX_WORKERS) as ex:
+            list(ex.map(fetch, issues))
+        st["builtAt"] = time.time()
+        _save_index(key, st)
+        with _index_lock:
+            _indexes[key] = st  # replaces the old finished index, if any
+    except Exception as e:
+        st["error"] = str(e)[:500]
+    finally:
+        st["thread"] = None
+
 
 def user_index(q):
     """Who is crashing: samples the latest 100 events of the top open issues.
     Crashlytics has no per-user query, so this is a sample, not a full count."""
+    # A user lookup should see crashes, non-fatals and ANRs alike.
+    q = {**q, "type": "ALL", "signal": "", "device": "", "os": ""}
     base = build_filter(q)
-    base.pop("issueSignals", None)
-    key = ("users", json.dumps([q["app"], base.get("issueErrorTypes"), q.get("version"), q.get("days")]))
-
-    def build():
-        issues = [i for i in overview(q)["issues"] if i["state"] == "OPEN"][:USER_INDEX_ISSUES]
-        prog = _progress[key] = {"done": 0, "total": len(issues)}
-
-        def tick():
-            prog["done"] += 1
-        fetched = parallel({i["id"]: (lambda iid=i["id"]: parse(mcp(
-            "crashlytics_list_events", appId=q["app"], filter={**base, "issueId": iid}, pageSize=100)))
-            for i in issues}, INDEX_WORKERS, tick)
-        titles = {i["id"]: i["title"] for i in issues}
-        users, n = {}, 0
-        for iid, evs in fetched.items():
-            for raw in evs if isinstance(evs, list) else []:
-                e, n = clean_event(raw), n + 1
-                k = e["customKeys"] if isinstance(e["customKeys"], dict) else {}
-                uid = e["user"] or k.get("user_id")
-                if not uid:
-                    continue
-                u = users.setdefault(uid, {"id": uid, "name": k.get("user_Name") or k.get("user_name"),
-                                           "company": k.get("company_id"), "events": 0, "issues": {},
-                                           "devices": set(), "versions": set(), "recent": []})
-                u["events"] += 1
-                u["devices"].add(e["device"].get("displayName"))
-                u["versions"].add(e["version"])
-                it = u["issues"].setdefault(iid, {"id": iid, "title": titles[iid], "events": 0, "last": ""})
-                it["events"] += 1
-                it["last"] = max(it["last"], e["time"] or "")
-                u["recent"].append({"time": e["time"], "issueId": iid, "title": titles[iid],
-                                    "version": e["version"], "device": e["device"].get("displayName"),
-                                    "os": e["os"].get("displayVersion"), "memFree": e["memory"].get("free")})
-        for u in users.values():
-            u["devices"] = sorted(x for x in u["devices"] if x)
-            u["versions"] = sorted((x for x in u["versions"] if x), key=short_ver, reverse=True)
-            u["issues"] = sorted(u["issues"].values(), key=lambda x: -x["events"])
-            u["recent"] = sorted(u["recent"], key=lambda x: x["time"] or "", reverse=True)[:30]
-        return {"users": sorted(users.values(), key=lambda u: -u["events"]),
-                "sampledIssues": len(issues), "sampledEvents": n, "builtAt": time.time()}
-
-    with _cache_lock:
-        hit = _cache.get(key)
-    if not hit and key in _build_errors:
-        raise RuntimeError(_build_errors.pop(key))  # report once; next poll retries
-    if not hit or time.time() - hit[0] > 600:
-        # Building takes a minute or more; do it off-request and let the UI poll.
-        with _building_lock:
-            if key not in _building:
-                def work():
-                    try:
-                        cached(key, 0, build)
-                    except Exception as e:
-                        _build_errors[key] = str(e)[:500]
-                    finally:
-                        _building.pop(key, None)
-                _building[key] = threading.Thread(target=work, daemon=True)
-                _building[key].start()
-        if not hit:
-            return {"building": True, **_progress.get(key, {"done": 0, "total": USER_INDEX_ISSUES})}
-    idx = hit[1]
+    key = ["users", q["app"], q.get("version"), range_key(q)]
+    k = json.dumps(key)
+    with _index_lock:
+        ready = _indexes.get(k) or _load_index(k)
+        if ready and ready.get("builtAt"):
+            _indexes[k] = ready
+        building = _indexes.get(k + "#building")
+        stale = not ready or not ready.get("builtAt") or time.time() - ready["builtAt"] > USER_INDEX_TTL
+        if stale and not (building and building["thread"]):
+            if building and building.get("error") and not ready:
+                _indexes.pop(k + "#building", None)
+                raise RuntimeError(building["error"])  # report once; the next poll retries
+            building = {"users": {}, "events": 0, "done": 0, "total": USER_INDEX_ISSUES,
+                        "builtAt": None, "error": None, "thread": None, "truncated": {}}
+            building["thread"] = threading.Thread(target=_build_index, args=(k, q, base, building), daemon=True)
+            _indexes[k + "#building"] = building
+            building["thread"].start()
+        in_progress = building if building and building["thread"] else None
+        # Serve the finished index if there is one; otherwise the partial one being built.
+        st = ready if ready and ready.get("builtAt") else (in_progress or {"users": {}, "events": 0})
+        users = [dict(u, issues=sorted(u["issues"].values(), key=lambda x: -x["events"]))
+                 for u in list(st["users"].values())]
     term = (q.get("q") or "").strip().lower()
-    hits = [u for u in idx["users"] if not term or term in
-            f"{u['id']} {u['name'] or ''} {u['company'] or ''}".lower()]
-    return {**idx, "users": hits[:50], "matches": len(hits)}
+    users.sort(key=lambda u: -u["events"])
+    hits = [u for u in users if not term or term in f"{u['id']} {u['name'] or ''} {u['company'] or ''}".lower()]
+    return {"users": hits[:50], "matches": len(hits), "sampledEvents": st["events"],
+            "sampledIssues": st.get("done", 0), "builtAt": st.get("builtAt"),
+            "building": bool(in_progress), "done": in_progress["done"] if in_progress else None,
+            "total": in_progress["total"] if in_progress else None,
+            "partial": not (ready and ready.get("builtAt")),
+            # Busy issues whose latest 100 events don't reach the start of the range.
+            "truncated": sorted(st.get("truncated", {}).values(), key=lambda t: t["since"] or "", reverse=True)}
 
 
 # ------------------------------------------------------------------- setup

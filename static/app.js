@@ -31,7 +31,7 @@ const store = {
 };
 
 const F = Object.assign(
-  { app: "", version: "5.7.1 (601)", type: "FATAL", days: "7", signal: "", device: "", os: "" },
+  { app: "", version: "5.7.1 (601)", type: "FATAL", days: "7", from: "", to: "", signal: "", device: "", os: "" },
   store.get("filters", {}));
 const ui = Object.assign({ q: "", state: "OPEN", sort: "events", scope: "all" }, store.get("ui", {}));
 let overview = null, issue = null, selectedEvent = 0, pollTimer = null, lastOk = null;
@@ -43,18 +43,20 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
 const fmt = (n) => (n == null || n === "" ? "–" : Number(n).toLocaleString());
 const pct = (n) => (n == null ? "–" : `${Number(n).toFixed(1)}%`);
 const bytes = (n) => (n ? `${(Number(n) / 2 ** 30).toFixed(1)} GB` : "–");
-const ago = (t) => {
-  if (!t) return "–";
-  const s = (Date.now() - new Date(t).getTime()) / 1000;
-  if (s < 60) return `${Math.round(s)}s ago`;
-  if (s < 3600) return `${Math.round(s / 60)}m ago`;
-  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
-  return `${Math.round(s / 86400)}d ago`;
-};
-const when = (t) => (t ? new Date(t).toLocaleString() : "–");
+// Exact local date-time, e.g. "26 Oct 2026, 08:45:12" (no relative "1h ago").
+const DT_FMT = new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric",
+  hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const dt = (t) => (t ? DT_FMT.format(new Date(t)) : "–");
 const isAppCode = (s) => /package:fa_flutter_gt\//.test(s || "");
+// datetime-local values are local wall time; the server wants UTC ISO.
+const localInput = (d) => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+const toUtc = (v) => new Date(v).toISOString();
+const rangeParams = () => F.days === "custom" && F.from && F.to
+  ? { from: toUtc(F.from), to: toUtc(F.to) } : { days: F.days === "custom" ? "7" : F.days };
+const rangeLabel = () => F.days === "custom" && F.from && F.to ? `${dt(F.from)} → ${dt(F.to)}`
+  : ({ 1: "last 24h", 7: "last 7 days", 30: "last 30 days", 90: "last 90 days" }[F.days] || `last ${F.days} days`);
 const filterParams = () => {
-  const p = { type: F.type, days: F.days };
+  const p = { type: F.type, ...rangeParams() };
   for (const k of ["app", "version", "signal", "device", "os"]) if (F[k]) p[k] = F[k];
   return p;
 };
@@ -140,6 +142,12 @@ document.addEventListener("mousemove", (e) => {
 // ---------------------------------------------------------------- filters
 function syncFilterInputs() {
   for (const k of ["version", "type", "days", "signal"]) $("#f-" + k).value = F[k];
+  // From/To always show the active window: the custom one, or the preset's.
+  const now = new Date();
+  $("#f-from").value = F.days === "custom" ? F.from : localInput(new Date(now - Number(F.days) * 864e5));
+  $("#f-to").value = F.days === "custom" ? F.to : localInput(now);
+  $("#f-apply").disabled = true;
+  $("#f-apply").classList.remove("primary");
   const chips = [];
   if (F.device) chips.push(["device", `Device: ${F.device}`]);
   if (F.os) chips.push(["os", `OS: ${F.os}`]);
@@ -152,8 +160,24 @@ function setFilter(patch) {
   syncFilterInputs();
   route();
 }
-for (const k of ["version", "type", "days", "signal"])
+for (const k of ["version", "type", "signal"])
   $("#f-" + k).addEventListener("change", (e) => setFilter({ [k]: e.target.value }));
+$("#f-days").addEventListener("change", (e) => {
+  if (e.target.value !== "custom") return setFilter({ days: e.target.value });
+  $("#f-from").focus(); // edit From/To, then Apply
+});
+// Editing either field makes it a custom range, applied with the Apply button.
+for (const id of ["#f-from", "#f-to"]) $(id).addEventListener("input", () => {
+  $("#f-days").value = "custom";
+  $("#f-apply").disabled = false;
+  $("#f-apply").classList.add("primary");
+});
+$("#f-apply").addEventListener("click", () => {
+  const from = $("#f-from").value, to = $("#f-to").value;
+  if (!from || !to) return alert("Pick both a start and an end date-time.");
+  if (new Date(from) >= new Date(to)) return alert("The range must start before it ends.");
+  setFilter({ days: "custom", from, to });
+});
 $("#f-app").addEventListener("change", (e) => setFilter({ app: e.target.value, version: "", device: "", os: "" }));
 $("#chips").addEventListener("click", (e) => {
   const k = e.target.dataset.clear;
@@ -225,7 +249,7 @@ function drawOverview() {
     ${newReleaseCard(o.newRel)}
 
     <div class="grid g-2">
-      <div class="card"><h2>Events per day <span class="muted small">UTC days${F.days > 30 ? ", last 30" : ""}</span></h2>
+      <div class="card"><h2>Events per day <span class="muted small">UTC days · ${esc(rangeLabel())}</span></h2>
         ${o.trend ? barChart(o.trend, "events") : `<div class="error">${esc(o.trendError || "")}</div>`}</div>
       <div class="card"><h2>${F.version ? "Crash-free users per day" : "Users affected per day"}</h2>
         ${o.trend ? (F.version ? lineChart(o.trend, "crashFreeUsers") : barChart(o.trend, "impactedUsers")) : ""}</div>
@@ -499,8 +523,8 @@ function drawIssue() {
         <div class="sub">${esc(d.versions[0]?.name || "")} worst</div></div>
       <div class="card tile"><div class="label">Devices hit</div><div class="val">${d.devices.length}${d.devices.length >= 15 ? "+" : ""}</div>
         <div class="sub">${esc(d.devices[0]?.name || "")} worst</div></div>
-      <div class="card tile"><div class="label">Last event</div><div class="val">${ago(d.events[0]?.time)}</div>
-        <div class="sub">${when(d.events[0]?.time)}</div></div>
+      <div class="card tile"><div class="label">Last event</div><div class="val" style="font-size:18px">${dt(d.events[0]?.time)}</div>
+        <div class="sub">${esc(d.events[0] ? `${d.events[0].version || ""} · ${d.events[0].device.displayName || ""}` : "")}</div></div>
     </div>
 
     <div class="grid g-2">
@@ -538,7 +562,7 @@ function drawIssue() {
       <div class="card"><h2>Recent events <span class="muted small">click one to inspect</span></h2>
         <div class="events scroll"><table><thead><tr><th>Time</th><th>User</th><th>Device</th><th>OS</th><th>Version</th></tr></thead><tbody>
         ${d.events.map((e, k) => `<tr class="click ${k === selectedEvent ? "active" : ""}" data-ev="${k}">
-          <td class="small">${esc(ago(e.time))}</td>
+          <td class="small">${esc(dt(e.time))}</td>
           <td class="small">${esc(e.customKeys?.user_Name || e.user || "–")}</td>
           <td class="small">${esc(e.device.displayName || "")}</td><td class="small">${esc(e.os.displayVersion || "")}</td>
           <td class="small">${esc(e.version || "")}</td></tr>`).join("") || `<tr><td colspan="5" class="muted">No events in range.</td></tr>`}
@@ -561,7 +585,7 @@ function drawIssue() {
         ${d.variants.map((v) => `<tr><td class="mono small"><a href="${esc(v.uri)}" target="_blank" rel="noopener">${esc(v.id.slice(0, 12))}…</a></td>
           <td class="num">${fmt(v.events)}</td><td class="num">${fmt(v.impactedUsers)}</td></tr>`).join("")}</tbody></table></div></div>
       <div class="card"><h2>Notes</h2>
-        ${d.notes.map((n) => `<div class="note"><div class="small muted">${esc(n.author || "")} · ${esc(when(n.createTime))}</div>${esc(n.body || n.note || JSON.stringify(n))}</div>`).join("") || `<div class="muted small">No notes yet.</div>`}
+        ${d.notes.map((n) => `<div class="note"><div class="small muted">${esc(n.author || "")} · ${esc(dt(n.createTime))}</div>${esc(n.body || n.note || JSON.stringify(n))}</div>`).join("") || `<div class="muted small">No notes yet.</div>`}
         <textarea id="noteText" placeholder="Add a note (saved to Firebase)…" style="margin-top:8px">${esc(noteDrafts[d.id] || "")}</textarea>
         <button class="btn" id="addNote" style="margin-top:6px">Add note</button>
       </div>
@@ -583,7 +607,7 @@ function drawIssue() {
 function blameHtml(b) {
   if (!b) return "";
   return `<div class="blame"><div class="small muted">Last change to the blamed line${b.rev ? " (as of the shipped build)" : ""}</div>
-    <div style="margin:4px 0"><b>${esc(b.author)}</b> · ${esc(when(b.date))} · <code>${esc(b.sha.slice(0, 10))}</code></div>
+    <div style="margin:4px 0"><b>${esc(b.author)}</b> · ${esc(dt(b.date))} · <code>${esc(b.sha.slice(0, 10))}</code></div>
     <div>${esc(b.summary)}</div>
     ${b.history?.length ? `<details><summary>Recent history of this file (${b.history.length})</summary>
       ${b.history.map((c) => `<div class="commit"><span class="sha">${esc(c.sha)}</span><span class="muted">${esc(c.date)}</span>
@@ -713,7 +737,7 @@ function aiHtml(id) {
     ${s.fix ? `<div class="small" style="margin:6px 0 2px">Run this in a terminal (it opens your browser to sign in), then try again:</div>${cmdBox(s.fix)}` : ""}
     <button class="btn" id="aiRun" style="margin-top:8px">Try again</button>`;
   if (s.data) return head + `<div class="md">${markdown(s.data.markdown)}</div>
-    <div class="small muted" style="margin-top:8px">Generated ${esc(ago(s.data.at * 1000))} in ${s.data.seconds}s${s.data.turns ? ` · ${s.data.turns} turns` : ""}${s.data.model ? ` · ${esc(s.data.model)}` : ""} · a draft to verify, not a verdict.</div>`;
+    <div class="small muted" style="margin-top:8px">Generated ${esc(dt(s.data.at * 1000))} in ${s.data.seconds}s${s.data.turns ? ` · ${s.data.turns} turns` : ""}${s.data.model ? ` · ${esc(s.data.model)}` : ""} · a draft to verify, not a verdict.</div>`;
   return head + `<div class="small muted" style="margin-bottom:8px">Sends the issue summary, stack traces, blamed source and breadcrumbs (user and company IDs stripped) to Claude via your local <code>claude</code> CLI. It can read and search the repo, but not edit or run anything.</div>
     <button class="btn" id="aiRun">Draft root cause</button>`;
 }
@@ -768,7 +792,7 @@ function fixPrompt(d) {
     `- Issue: ${i.title}`,
     `- Exception: ${i.subtitle}`,
     `- Type: ${i.errorType} · first seen ${i.firstSeenVersion} · last seen ${i.lastSeenVersion}`,
-    `- Impact (${F.version || "all versions"}, last ${F.days}d): ${fmt(listed?.events ?? d.versions.reduce((s, v) => s + v.events, 0))} events${listed ? `, ${fmt(listed.impactedUsers)} users` : ""}`,
+    `- Impact (${F.version || "all versions"}, ${rangeLabel()}): ${fmt(listed?.events ?? d.versions.reduce((s, v) => s + v.events, 0))} events${listed ? `, ${fmt(listed.impactedUsers)} users` : ""}`,
     (i.signals || []).length ? `- Signals: ${(i.signals || []).map((s) => s.description).join(" ")}` : null,
     `- Top versions: ${top(d.versions)}`,
     `- Top devices: ${top(d.devices)} · Top OS: ${top(d.os)}`,
@@ -849,7 +873,7 @@ function eventDetails(e) {
   const keys = e.customKeys && typeof e.customKeys === "object" ? e.customKeys : {};
   const mem = e.memory, sto = e.storage;
   return `<dl class="kv">
-    <dt>Time</dt><dd>${esc(when(e.time))} <span class="muted">(received ${esc(when(e.received))})</span></dd>
+    <dt>Time</dt><dd>${esc(dt(e.time))} <span class="muted">(received ${esc(dt(e.received))})</span></dd>
     <dt>Device</dt><dd>${esc(e.device.displayName)} · ${esc(e.device.architecture || "")} · ${esc(e.device.formFactor || "")}</dd>
     <dt>OS</dt><dd>Android ${esc(e.os.displayVersion)} ${e.os.modificationState && e.os.modificationState !== "UNMODIFIED" ? `<span class="badge crit">${esc(e.os.modificationState)}</span>` : ""}</dd>
     <dt>App</dt><dd>${esc(e.version)} · ${esc(e.processState || "")} · ${esc(e.orientation || "")}</dd>
@@ -895,7 +919,7 @@ function copyTicket() {
   const md = [
     `## ${shortTitle(i.title)}`, "", `**${i.subtitle || ""}**`, "",
     `- Type: ${i.errorType} · State: ${i.state}`,
-    `- Events: ${fmt(listed?.events)} · Users: ${fmt(listed?.impactedUsers)} (${F.version || "all versions"}, last ${F.days}d)`,
+    `- Events: ${fmt(listed?.events)} · Users: ${fmt(listed?.impactedUsers)} (${F.version || "all versions"}, ${rangeLabel()})`,
     `- Seen: ${i.firstSeenVersion} → ${i.lastSeenVersion}`,
     `- Top versions: ${d.versions.slice(0, 3).map((v) => `${v.name} (${fmt(v.events)})`).join(", ")}`,
     `- Top devices: ${d.devices.slice(0, 3).map((v) => `${v.name} (${fmt(v.events)})`).join(", ")}`,
@@ -926,21 +950,27 @@ async function loadUsers() {
   clearTimeout(usersTimer);
   const r = await api("/api/users", { ...filterParams(), q: ui.userQ || "" });
   if (!$("#userRes")) return;
-  if (r.building) {
-    const p = r.total ? (r.done / r.total) * 100 : 0;
-    $("#userRes").innerHTML = `<div class="muted small"><span class="spinner"></span>Building the user index from Crashlytics events
-      (${r.done || 0}/${r.total || "?"} issues)… takes 2–3 minutes the first time, then refreshes in the background.</div>
-      <div class="progress"><i style="width:${p}%"></i></div>`;
-    usersTimer = setTimeout(loadUsers, 4000);
-    return;
-  }
   usersData = r;
   drawUsers();
+  // Keep polling while a build runs; results fill in as each issue's events land.
+  if (r.building) usersTimer = setTimeout(loadUsers, 4000);
 }
 function drawUsers() {
   const r = usersData;
-  $("#userRes").innerHTML = `<div class="small muted" style="margin-bottom:8px">${fmt(r.matches)} users match · sample of
-    ${fmt(r.sampledEvents)} events from the top ${r.sampledIssues} open issues (latest 100 each) · built ${esc(ago(r.builtAt * 1000))}
+  const pctDone = r.total ? (r.done / r.total) * 100 : 0;
+  const status = r.building
+    ? `<div class="small muted"><span class="spinner"></span>${r.partial
+        ? `Building the user index: ${r.done}/${r.total} issues read, results fill in as they arrive (first build takes a few minutes).`
+        : `Refreshing in the background (${r.done}/${r.total}); showing the index from ${esc(dt(r.builtAt * 1000))}.`}</div>
+       <div class="progress"><i style="width:${pctDone}%"></i></div>` : "";
+  const tr = r.truncated || [];
+  const gap = tr.length ? `<div class="badge warn" style="display:block;white-space:normal;padding:8px 10px;margin:8px 0">
+      ⚠ ${tr.length} busy issue${tr.length > 1 ? "s" : ""}: the latest 100 events only reach back to
+      <b>${esc(dt(tr[0].since))}</b>${tr.length > 1 ? " (or later)" : ""}, so a user's earlier crashes there aren't in this sample.
+      To find a specific incident, set <b>Range → Custom range…</b> to a few minutes around it.
+      <details style="margin-top:4px"><summary>Which issues</summary>${tr.map((t) => `<div class="small">${esc(shortTitle(t.title))}: since ${esc(dt(t.since))}</div>`).join("")}</details></div>` : "";
+  $("#userRes").innerHTML = `${status}${gap}<div class="small muted" style="margin-bottom:8px">Crashes, non-fatals and ANRs · ${esc(rangeLabel())} · ${fmt(r.matches)} users match · sample of
+    ${fmt(r.sampledEvents)} events from ${r.sampledIssues} open issues (latest 100 each)${r.builtAt ? ` · built ${esc(dt(r.builtAt * 1000))}` : ""}
     · counts are a sample, not totals</div>
     <div class="scroll"><table><thead><tr><th>User</th><th>Company</th><th class="num">Events</th><th class="num">Issues</th>
       <th>Devices</th><th>Versions</th><th>Last crash</th></tr></thead><tbody>
@@ -948,9 +978,9 @@ function drawUsers() {
       <td>${esc(u.name || "–")}<div class="t-sub">${esc(u.id)}</div></td><td>${esc(u.company || "–")}</td>
       <td class="num">${u.events}</td><td class="num">${u.issues.length}</td>
       <td class="small">${esc(u.devices.join(", "))}</td><td class="small">${esc(u.versions.join(", "))}</td>
-      <td class="small">${esc(ago(u.recent[0]?.time))}</td></tr>
+      <td class="small">${esc(dt(u.recent[0]?.time))}</td></tr>
       ${usersSel === u.id ? `<tr><td colspan="7">${userDetail(u)}</td></tr>` : ""}`).join("") ||
-      `<tr><td colspan="7" class="muted">No user in the sample matches.</td></tr>`}
+      `<tr><td colspan="7" class="muted">${r.building && !r.sampledEvents ? "Reading the first issues…" : "No user in the sample matches."}</td></tr>`}
     </tbody></table></div>`;
   $("#userRes").querySelectorAll("[data-user]").forEach((tr) => tr.addEventListener("click", () => {
     usersSel = usersSel === tr.dataset.user ? null : tr.dataset.user; drawUsers();
@@ -959,11 +989,11 @@ function drawUsers() {
 function userDetail(u) {
   return `<div class="grid g-2" style="margin:6px 0">
     <div><div class="small muted" style="margin-bottom:4px">Issues this user hits</div>
-      ${u.issues.map((i) => `<div class="commit" style="grid-template-columns:40px 1fr 90px"><b>${i.events}×</b>
-        <a href="#/issue/${esc(i.id)}">${esc(shortTitle(i.title))}</a><span class="muted">${esc(ago(i.last))}</span></div>`).join("")}</div>
+      ${u.issues.map((i) => `<div class="commit" style="grid-template-columns:40px 1fr 150px"><b>${i.events}×</b>
+        <span><a href="#/issue/${esc(i.id)}">${esc(shortTitle(i.title))}</a>${i.detail ? `<div class="t-sub">${esc(i.detail)}</div>` : ""}</span><span class="muted">${esc(dt(i.last))}</span></div>`).join("")}</div>
     <div><div class="small muted" style="margin-bottom:4px">Recent crashes</div>
       ${u.recent.slice(0, 15).map((e) => `<div class="commit" style="grid-template-columns:80px 1fr 150px">
-        <span class="muted">${esc(ago(e.time))}</span><a href="#/issue/${esc(e.issueId)}">${esc(shortTitle(e.title))}</a>
+        <span class="muted">${esc(dt(e.time))}</span><a href="#/issue/${esc(e.issueId)}">${esc(shortTitle(e.title))}</a>
         <span class="small muted">${esc(e.version)} · A${esc(e.os)} · ${bytes(e.memFree)} free</span></div>`).join("")}</div>
   </div>`;
 }
@@ -975,12 +1005,12 @@ const alertCfg = Object.assign({ on: false, spike: "" }, store.get("alerts", {})
 let alertTimer = null, alertInfo = {}, unread = 0;
 const baseTitle = document.title;
 
-const alertKey = () => "seen." + JSON.stringify([F.app, F.version, F.type, F.days]);
+const alertKey = () => "seen." + JSON.stringify([F.app, F.version, F.type, rangeParams()]);
 
 async function alertCheck() {
   if (!alertCfg.on) return;
   try {
-    const p = { type: F.type, days: F.days, ...(F.app ? { app: F.app } : {}), ...(F.version ? { version: F.version } : {}) };
+    const p = { type: F.type, ...rangeParams(), ...(F.app ? { app: F.app } : {}), ...(F.version ? { version: F.version } : {}) };
     const [ov, nr] = await Promise.all([api("/api/overview", p), api("/api/new-in-release", p).catch(() => null)]);
     const capped = ov.issues.length >= 100; // top-100 list: issues can enter from below
     const cur = {
@@ -1069,7 +1099,7 @@ function drawAlertPanel() {
   el.innerHTML = `
     <label class="toggle"><input type="checkbox" id="alOn" ${alertCfg.on ? "checked" : ""}> <b>Alerts on</b></label>
     <div class="small" style="margin:6px 0">Alerts when a check finds: a crash <b>new in the release</b>, a <b>new issue</b>, a <b>regressed</b> issue${Number(alertCfg.spike) > 0 ? `, or an issue gaining ≥ ${fmt(alertCfg.spike)} events` : ""}.
-      Checks every minute on any page, even in a background tab, for ${esc(F.version || "all versions")} · ${esc(F.type)} · ${esc(F.days)}d.</div>
+      Checks every minute on any page, even in a background tab, for ${esc(F.version || "all versions")} · ${esc(F.type)} · ${esc(rangeLabel())}.</div>
     <label class="small">Also alert when an issue gains at least
       <input type="number" id="alSpike" min="1" placeholder="off" value="${esc(alertCfg.spike)}" style="width:80px;min-width:0"> events between checks</label>
     <div class="badge ${pcls}" style="white-space:normal;display:block;margin:8px 0;padding:6px 8px">${esc(ptext)}</div>
@@ -1218,8 +1248,8 @@ function renderSetup(silent) {
           <div class="step"><h3>Sign in to Firebase</h3><p>Use your work Google account. The MCP reuses this login.</p>
             ${cmdBox("npx -y firebase-tools@latest login")}</div>
           <div class="step"><h3>Get Crashlytics access</h3><p>Ask a Firebase admin to add your Google account to <code>${esc(project)}</code> with at least the <b>Firebase Crashlytics Viewer</b> role (Owner/Editor also work).</p></div>
-          <div class="step"><h3>Start the dashboard</h3><p>From the <code>crashlytics-dashboard</code> folder. Point <code>--repo</code> at your <code>fa_flutter_gt</code> checkout.</p>
-            ${cmdBox("./start.sh --repo ~/path/to/fa_flutter_gt")}</div>
+          <div class="step"><h3>Start the dashboard</h3><p>From the <code>crashlytics-dashboard</code> folder. The setup wizard asks for your <code>fa_flutter_gt</code> path and remembers it.</p>
+            ${cmdBox("./start.sh")}</div>
           <div class="step"><h3>Optional: AI root-cause drafts</h3><p>Install Claude Code and sign in once; the dashboard calls it read-only.</p>
             ${cmdBox("npm install -g @anthropic-ai/claude-code && claude")}</div>
           <div class="step"><h3>Optional: Crashlytics in your own Claude Code</h3><p>Same MCP server, available in any Claude Code session:</p>

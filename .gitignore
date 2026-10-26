@@ -3,3 +3,5 @@ config.local.json
 __pycache__/
 *.pyc
 .DS_Store
+# Finished user indexes (sampled crash events), rebuilt automatically
+.cache/

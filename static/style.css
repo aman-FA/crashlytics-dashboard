@@ -402,3 +402,7 @@ svg.flow .packet { fill: var(--accent); }
 body.wizard-mode .tabs, body.wizard-mode .status, body.wizard-mode #appName { display: none; }
 body.wizard-mode .brand a { pointer-events: none; }
 .wiz-foot a { white-space: nowrap; } /* one solid click target, never split across lines */
+.custom-range { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+.custom-range[hidden] { display: none; }
+.custom-range input { font: inherit; color: var(--ink); background: var(--surface2); border: 1px solid var(--border);
+  border-radius: 7px; padding: 5px 8px; color-scheme: light dark; }
